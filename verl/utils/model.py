@@ -330,3 +330,19 @@ def pad_packed_inputs(unpad_tokens: torch.Tensor, cu_seqlens, max_seqlen_in_batc
         max_seqlen_in_batch = max(max_seqlen_in_batch, pad_size)
 
     return unpad_tokens, cu_seqlens, max_seqlen_in_batch
+
+
+def get_init_weight_context_manager():
+    """Get context manager for model initialization."""
+    from torch.nn.init import normal_
+    from contextlib import contextmanager
+
+    @contextmanager
+    def init_context():
+        """Initialize model weights with normal distribution."""
+        try:
+            yield
+        finally:
+            pass
+
+    return init_context

@@ -61,7 +61,9 @@ class PrecisionType(object):
 
     @staticmethod
     def to_dtype(precision):
-        if precision in HALF_LIST:
+        if isinstance(precision, torch.dtype):
+            return precision
+        elif precision in HALF_LIST:
             return torch.float16
         elif precision in FLOAT_LIST:
             return torch.float32

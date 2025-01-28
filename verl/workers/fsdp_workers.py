@@ -34,9 +34,11 @@ from verl.utils.fsdp_utils import get_fsdp_wrap_policy, offload_fsdp_grad, init_
 from verl.utils.fsdp_utils import offload_fsdp_optimizer, offload_fsdp_param_and_grad, load_fsdp_optimizer, \
     load_fsdp_param_and_grad
 from verl.utils.import_utils import import_external_libs
-from verl.utils.model import compute_position_id_with_mask
+from verl.utils.model import compute_position_id_with_mask, print_model_size
 from verl.utils.flops_counter import FlopsCounter
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+from verl.utils.optim import create_optimizer, create_scheduler
+from verl.models.ppo.critic import DataParallelPPOCritic
 
 from codetiming import Timer
 
@@ -115,11 +117,13 @@ class ActorRolloutRefWorker(Worker):
                                override_model_config,
                                use_remove_padding=False,
                                enable_gradient_checkpointing=False,
-                               trust_remote_code=False):
+                               trust_remote_code=False,
+                               torch_dtype=torch.float32,
+                               low_cpu_mem_usage=False):
         from verl.utils.model import print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
         from transformers import AutoModelForCausalLM, AutoConfig
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision, CPUOffload
         from torch import optim
 
         log_gpu_memory_usage('Before init from HF AutoModel', logger=logger)
@@ -129,7 +133,6 @@ class ActorRolloutRefWorker(Worker):
         # TODO(zhangchi.usc1992): 1. support create from random initialized model. 2. Support init with FSDP directly
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
 
-        torch_dtype = fsdp_config.get('model_dtype', None)
         if torch_dtype is None:
             torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
         else:
@@ -161,17 +164,19 @@ class ActorRolloutRefWorker(Worker):
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            actor_module = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=local_path,
-                                                                torch_dtype=torch_dtype,
-                                                                config=actor_model_config,
-                                                                attn_implementation='flash_attention_2',
-                                                                trust_remote_code=trust_remote_code)
-            # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
-            actor_module.to(torch_dtype)
-
-            if enable_gradient_checkpointing:
-                actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
+            actor_module = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                config=actor_model_config,
+                device_map=None,  # Required for FSDP
+                low_cpu_mem_usage=True,
+                trust_remote_code=True,
+                torch_dtype=torch.float16 if self.config.model.get('external_lib') == 'auto_gptq' else None
+            )
         torch.distributed.barrier()
+
+        # Don't move GPTQ model to device here - it will be handled by FSDP
+        if self.config.model.get('external_lib') != 'auto_gptq':
+            actor_module = actor_module.to(dtype=get_torch_dtype(self.config))
 
         if self.rank == 0:
             print_model_size(actor_module)
@@ -307,7 +312,10 @@ class ActorRolloutRefWorker(Worker):
                 override_model_config=override_model_config,
                 use_remove_padding=use_remove_padding,
                 enable_gradient_checkpointing=self.config.model.get('enable_gradient_checkpointing', False),
-                trust_remote_code=self.config.model.get('trust_remote_code', False))
+                trust_remote_code=self.config.model.get('trust_remote_code', False),
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=self.config.model.get('low_cpu_mem_usage', False)
+            )
 
             # get the original unwrapped module
             self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
@@ -537,20 +545,17 @@ class CriticWorker(Worker):
         self.config.forward_micro_batch_size //= (torch.distributed.get_world_size() //
                                                   self.ulysses_sequence_parallel_size)
 
-    def _build_critic_model_optimizer(self, config):
-        # the following line is necessary
-        from verl.utils.model import LambdaLayer, print_model_size, squeeze
-        from verl.utils.torch_dtypes import PrecisionType
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision
-        from torch import optim
+    def _build_critic_model(self, local_path, config):
+        """Build critic model."""
+        from transformers import AutoConfig, AutoModelForTokenClassification
+        import warnings
+        from verl.utils.model import print_model_size
 
-        local_path = copy_local_path_from_hdfs(config.model.path)
-        # note that the tokenizer between actor and critic may be different. So override tokenizer info with actor info
-        # using random initialized model from any architecture. May not be the same as Actor.
-
+        # Initialize tokenizer
         tokenizer_path = copy_local_path_from_hdfs(config.model.tokenizer_path)
         self.tokenizer = hf_tokenizer(tokenizer_path, trust_remote_code=config.model.get('trust_remote_code', False))
 
+        # Override config
         from omegaconf import OmegaConf
         override_config = OmegaConf.to_container(self.config.model.get('override_config', OmegaConf.create()))
         override_config_kwargs = {
@@ -562,89 +567,74 @@ class CriticWorker(Worker):
         if self.rank == 0:
             print(f'Critic overriding config {override_config_kwargs}')
 
-        torch_dtype = self.config.model.fsdp_config.get('model_dtype', 'fp32')
-        torch_dtype = PrecisionType.to_dtype(torch_dtype)
-
-        from transformers import AutoConfig, AutoModelForTokenClassification
-        from torch import nn
-
+        # Set model config
         trust_remote_code = False
         critic_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
         critic_model_config.num_labels = 1
 
-        use_remove_padding = config.model.get('use_remove_padding', False)
-        if use_remove_padding:
-            from verl.models.registry import check_model_support_rmpad
-            check_model_support_rmpad(critic_model_config.model_type)
-
-        if use_remove_padding and self.ulysses_sequence_parallel_size > 1:
-            from verl.models.transformers.monkey_patch import apply_monkey_patch
-            apply_monkey_patch(critic_model_config, verbose=True)
-
-        init_context = get_init_weight_context_manager()
-        with init_context(), warnings.catch_warnings():
+        # Initialize model
+        with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             setattr(critic_model_config, 'classifier_dropout', 0.)
             setattr(critic_model_config, 'hidden_dropout', '0')
-            critic_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
-                                                                            torch_dtype=torch_dtype,
-                                                                            config=critic_model_config,
-                                                                            attn_implementation='flash_attention_2',
-                                                                            trust_remote_code=trust_remote_code)
+            critic_module = AutoModelForTokenClassification.from_pretrained(
+                pretrained_model_name_or_path=local_path,
+                config=critic_model_config,
+                attn_implementation='flash_attention_2',
+                trust_remote_code=trust_remote_code,
+                device_map="auto",
+                torch_dtype=torch.float32
+            )
 
-            # some parameters may not in torch_dtype
-            critic_module.to(torch_dtype)
+        if config.model.get('enable_gradient_checkpointing', False):
+            critic_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
 
-            if config.model.get('enable_gradient_checkpointing', False):
-                critic_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
         if self.rank == 0:
             print_model_size(critic_module)
 
         self.critic_model_config = critic_model_config
+        return critic_module
 
-        fsdp_config = self.config.model.fsdp_config
-        mixed_precision_config = fsdp_config.get('mixed_precision', None)
-        if mixed_precision_config is not None:
-            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get('param_dtype', 'bf16'))
-            reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get('reduce_dtype', 'fp32'))
-            buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get('buffer_dtype', 'fp32'))
-        else:
-            param_dtype = torch.bfloat16
-            reduce_dtype = torch.float32
-            buffer_dtype = torch.float32
+    def _build_critic_model_optimizer(self, local_path, config):
+        """Build critic model optimizer."""
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, CPUOffload
+        from verl.utils.fsdp_utils import get_fsdp_wrap_policy
+        from verl.utils.optim import create_optimizer, create_scheduler, offload_fsdp_optimizer
 
-        mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
+        critic_module = self._build_critic_model(local_path, config)
 
-        auto_wrap_policy = get_fsdp_wrap_policy(module=critic_module, config=self.config.model.fsdp_config.wrap_policy)
+        # Initialize parameters before moving to GPU
+        for param in critic_module.parameters():
+            if param.dtype == torch.float16:
+                param.data = param.data.float()
 
-        log_gpu_memory_usage('Before critic FSDP', logger=None)
+        # Move model to GPU
+        critic_module = critic_module.cuda()
 
+        # Wrap model with FSDP
         critic_module = FSDP(critic_module,
-                             param_init_fn=init_fn,
-                             use_orig_params=False,
-                             auto_wrap_policy=auto_wrap_policy,
-                             device_id=torch.cuda.current_device(),
-                             sharding_strategy=ShardingStrategy.FULL_SHARD,
-                             mixed_precision=mixed_precision,
-                             sync_module_states=True,
-                             forward_prefetch=False)
+                           device_mesh=self.ulysses_device_mesh,
+                           auto_wrap_policy=get_fsdp_wrap_policy(config.model.fsdp_config.wrap_policy),
+                           sharding_strategy=ShardingStrategy.FULL_SHARD,
+                           cpu_offload=CPUOffload(offload_params=config.model.fsdp_config.param_offload),
+                           mixed_precision=None)
 
-        log_gpu_memory_usage('After critic FSDP', logger=None)
+        # Create optimizer and scheduler
+        critic_optimizer = create_optimizer(
+            critic_module,
+            config.optim,
+            config.model.fsdp_config,
+            self.rank,
+        )
+        critic_lr_scheduler = create_scheduler(
+            critic_optimizer,
+            config.optim,
+            config.model.fsdp_config,
+            self.rank,
+        )
 
-        critic_optimizer = optim.AdamW(critic_module.parameters(),
-                                       lr=config.optim.lr,
-                                       betas=config.optim.get('betas', (0.9, 0.999)),
-                                       weight_decay=config.optim.get('weight_decay', 1e-2))
-
-        total_steps = config.optim.get('total_training_steps', 0)
-        num_warmup_steps_ratio = config.optim.get('lr_warmup_steps_ratio', 0.)
-        num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
-
-        print(f'Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}')
-
-        from verl.utils.torch_functional import get_constant_schedule_with_warmup
-        critic_lr_scheduler = get_constant_schedule_with_warmup(optimizer=critic_optimizer,
-                                                                num_warmup_steps=num_warmup_steps)
+        if config.model.fsdp_config.get('optimizer_offload', False):
+            offload_fsdp_optimizer(optimizer=critic_optimizer)
 
         return critic_module, critic_optimizer, critic_lr_scheduler
 
@@ -652,10 +642,8 @@ class CriticWorker(Worker):
     def init_model(self):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get('external_lib', None))
-
-        from verl.workers.critic import DataParallelPPOCritic
         self.critic_module, self.critic_optimizer, self.critic_lr_scheduler = self._build_critic_model_optimizer(
-            self.config)
+            copy_local_path_from_hdfs(self.config.model.path), self.config)
 
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.critic_module, offload_grad=self._is_offload_grad)
@@ -663,8 +651,11 @@ class CriticWorker(Worker):
             offload_fsdp_optimizer(optimizer=self.critic_optimizer)
 
         self.critic = DataParallelPPOCritic(config=self.config,
-                                            critic_module=self.critic_module,
-                                            critic_optimizer=self.critic_optimizer)
+                                            module=self.critic_module,
+                                            optimizer=self.critic_optimizer,
+                                            tokenizer=self.tokenizer,
+                                            rank=self.rank,
+                                            torch_dtype=torch.float16)
 
         self.flops_counter = FlopsCounter(self.critic_model_config)
 

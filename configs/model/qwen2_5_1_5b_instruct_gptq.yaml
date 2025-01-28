@@ -1,0 +1,28 @@
+defaults:
+  - base_model
+
+model:
+  path: ${oc.env:BASE_MODEL}
+  external_lib: auto_gptq  # 添加 auto_gptq 作为外部库
+  override_config:
+    torch_dtype: float16  # 为 GPTQ 模型指定 dtype
+    use_flash_attention_2: true
+    use_cache: false
+    trust_remote_code: true  # 添加此项以支持 GPTQ
+  use_remove_padding: false
+  enable_gradient_checkpointing: false
+  fsdp_config:
+    fsdp_size: -1
+    param_offload: false
+    grad_offload: false
+    optimizer_offload: false
+    wrap_policy:
+      min_num_params: 0
+
+tokenizer:
+  path: ${model.path}
+  padding_side: left
+  truncation_side: left
+  pad_token_id: 151643
+  eos_token_id: 151645
+  trust_remote_code: true  # 添加此项以支持 GPTQ
